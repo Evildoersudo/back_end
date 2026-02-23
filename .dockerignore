@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.db
+.env
+tools
+design_advice_*.md
+NO_ESP_TEST.md
+

@@ -1,0 +1,50 @@
+services:
+  db:
+    image: postgres:16
+    container_name: dorm-backend-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dorm_power}
+      POSTGRES_USER: ${POSTGRES_USER:-dorm_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+      TZ: Asia/Shanghai
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dorm_user} -d ${POSTGRES_DB:-dorm_power}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dorm-backend:latest
+    container_name: dorm-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      BACKEND_HOST: 0.0.0.0
+      BACKEND_PORT: 8000
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-dorm_user}:${POSTGRES_PASSWORD:-change_me}@db:5432/${POSTGRES_DB:-dorm_power}
+      MQTT_ENABLED: ${MQTT_ENABLED:-1}
+      MQTT_HOST: ${MQTT_HOST:-175.27.162.174}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_TOPIC_PREFIX: ${MQTT_TOPIC_PREFIX:-dorm}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@dorm.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change_admin_password}
+      CMD_TIMEOUT_SECONDS: ${CMD_TIMEOUT_SECONDS:-30}
+      ONLINE_TIMEOUT_SECONDS: ${ONLINE_TIMEOUT_SECONDS:-10}
+      TZ: Asia/Shanghai
+
+volumes:
+  pg_data:
+

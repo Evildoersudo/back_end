@@ -18,6 +18,7 @@ class DeviceOut(BaseModel):
     room: str
     online: bool
     lastSeen: str
+    offlineReason: str | None = None
 
 
 class StripStatusOut(BaseModel):
@@ -63,3 +64,20 @@ class AIReportOut(BaseModel):
     summary: str
     anomalies: list[str]
     suggestions: list[str]
+
+
+class AuthLoginRequest(BaseModel):
+    account: str = Field(min_length=3, max_length=128)
+    password: str = Field(min_length=6, max_length=128)
+
+
+class AuthUserOut(BaseModel):
+    username: str
+    email: str
+    role: Literal["admin"]
+
+
+class AuthLoginOut(BaseModel):
+    ok: bool
+    token: str
+    user: AuthUserOut

@@ -1,17 +1,20 @@
 ﻿from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import re
+import secrets
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .models import CommandRecord, Device, StripStatus, Telemetry
+from .models import CommandRecord, Device, StripStatus, Telemetry, UserAccount
 from .schemas import CmdRequest, CmdStateOut, SocketStatus
 
 RANGE_CONFIG = {
@@ -58,6 +61,139 @@ def ensure_seed_data(session: Session) -> None:
     )
     session.add(device)
     session.add(status)
+
+
+def _hash_secret(secret: str, salt: str, iterations: int = 160_000) -> str:
+    digest = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt.encode("utf-8"), iterations)
+    return digest.hex()
+
+
+def hash_password(password: str) -> str:
+    iterations = 160_000
+    salt = secrets.token_hex(16)
+    digest = _hash_secret(password, salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt}${digest}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algo, iterations_str, salt, digest = encoded.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        calc = _hash_secret(password, salt, int(iterations_str))
+        return hmac.compare_digest(calc, digest)
+    except Exception:
+        return False
+
+
+def find_user_by_account(session: Session, account: str) -> UserAccount | None:
+    normalized = account.strip()
+    if not normalized:
+        return None
+    return session.scalar(
+        select(UserAccount).where(
+            or_(
+                UserAccount.username == normalized,
+                UserAccount.email == normalized.lower(),
+            )
+        ).limit(1)
+    )
+
+
+def register_user(session: Session, username: str, email: str, password: str) -> UserAccount:
+    now = int(time.time())
+    normalized_username = username.strip()
+    normalized_email = email.strip().lower()
+    if session.get(UserAccount, normalized_username) is not None:
+        raise ValueError("username already exists")
+    if session.scalar(select(UserAccount.username).where(UserAccount.email == normalized_email).limit(1)):
+        raise ValueError("email already exists")
+    user = UserAccount(
+        username=normalized_username,
+        email=normalized_email,
+        password_hash=hash_password(password),
+        role="admin",
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(user)
+    return user
+
+
+def login_user(session: Session, account: str, password: str) -> UserAccount | None:
+    normalized = account.strip()
+    admin_username = settings.admin_username.strip() or "admin"
+    admin_email = settings.admin_email.strip().lower() or "admin@dorm.local"
+    if normalized not in {admin_username, admin_email}:
+        return None
+    user = session.get(UserAccount, admin_username)
+    if user is None:
+        return None
+    if not verify_password(password, user.password_hash):
+        return None
+    user.updated_at = int(time.time())
+    return user
+
+
+def create_reset_code(session: Session, account: str, expires_in: int = 600) -> tuple[UserAccount | None, str]:
+    user = find_user_by_account(session, account)
+    if user is None:
+        return None, ""
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    now = int(time.time())
+    user.reset_code_hash = hash_password(code)
+    user.reset_expires_at = now + expires_in
+    user.updated_at = now
+    return user, code
+
+
+def reset_password_with_code(session: Session, account: str, code: str, new_password: str) -> bool:
+    user = find_user_by_account(session, account)
+    if user is None:
+        return False
+    now = int(time.time())
+    if user.reset_expires_at < now:
+        return False
+    if not user.reset_code_hash or not verify_password(code, user.reset_code_hash):
+        return False
+    user.password_hash = hash_password(new_password)
+    user.reset_code_hash = ""
+    user.reset_expires_at = 0
+    user.updated_at = now
+    return True
+
+
+def ensure_default_admin(session: Session) -> None:
+    now = int(time.time())
+    username = settings.admin_username.strip() or "admin"
+    email = settings.admin_email.strip().lower() or "admin@dorm.local"
+    password = settings.admin_password
+
+    user = session.get(UserAccount, username)
+    if user is None:
+        user = UserAccount(
+            username=username,
+            email=email,
+            password_hash=hash_password(password),
+            role="admin",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(user)
+        return
+
+    changed = False
+    if user.email != email:
+        user.email = email
+        changed = True
+    if not verify_password(password, user.password_hash):
+        user.password_hash = hash_password(password)
+        changed = True
+    if user.role != "admin":
+        user.role = "admin"
+        changed = True
+    if changed:
+        user.updated_at = now
 
 
 def parse_room(device_id: str) -> str:
@@ -170,6 +306,60 @@ def save_telemetry_point(session: Session, device_id: str, payload: dict[str, An
         current_a=float(payload.get("current_a", 0.0)),
     )
     session.add(point)
+
+
+def mark_device_offline(session: Session, device_id: str, reason: str = "", ts: int | None = None) -> Device:
+    now = ts or int(time.time())
+    offline_seen = max(0, now - settings.online_timeout_seconds - 1)
+    dev = session.get(Device, device_id)
+    if dev is None:
+        room, name = parse_device_meta(device_id)
+        dev = Device(
+            id=device_id,
+            name=name,
+            room=room,
+            online=False,
+            last_seen_ts=offline_seen,
+        )
+        session.add(dev)
+    else:
+        dev.last_seen_ts = min(dev.last_seen_ts, offline_seen)
+        dev.online = False
+
+    status = session.get(StripStatus, device_id)
+    if status is None:
+        status = StripStatus(
+            device_id=device_id,
+            ts=now,
+            online=False,
+            total_power_w=0.0,
+            voltage_v=220.0,
+            current_a=0.0,
+            sockets_json="[]",
+        )
+        session.add(status)
+    else:
+        status.ts = now
+        status.online = False
+        status.total_power_w = 0.0
+        status.current_a = 0.0
+        try:
+            sockets = json.loads(status.sockets_json)
+        except Exception:
+            sockets = []
+        if isinstance(sockets, list):
+            normalized: list[dict[str, Any]] = []
+            for s in sockets:
+                if not isinstance(s, dict):
+                    continue
+                item = dict(s)
+                item["on"] = False
+                item["power_w"] = 0.0
+                normalized.append(item)
+            status.sockets_json = json.dumps(normalized, ensure_ascii=False)
+
+    _ = reason
+    return dev
 
 
 def create_cmd_record(session: Session, device_id: str, req: CmdRequest) -> CommandRecord:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -22,13 +23,20 @@ from .services import (
     ai_report,
     build_telemetry_series,
     create_cmd_record,
+    ensure_default_admin,
     ensure_seed_data,
     get_cmd_state,
     has_pending_conflict,
+    login_user,
     mark_timeouts,
     refresh_online_state,
     update_cmd_state,
     utc_iso,
+)
+from .schemas import (
+    AuthLoginOut,
+    AuthLoginRequest,
+    AuthUserOut,
 )
 from .ws import ws_manager
 
@@ -53,6 +61,7 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     with get_session() as session:
         ensure_seed_data(session)
+        ensure_default_admin(session)
         mark_timeouts(session)
 
     mqtt_bridge.set_loop(asyncio.get_running_loop())
@@ -87,6 +96,20 @@ def health() -> dict[str, Any]:
     }
 
 
+@app.post("/api/auth/login", response_model=AuthLoginOut)
+def auth_login(req: AuthLoginRequest) -> Any:
+    with get_session() as session:
+        user = login_user(session, req.account, req.password)
+        if user is None:
+            return error_response(401, "UNAUTHORIZED", "invalid account or password")
+        token = secrets.token_urlsafe(24)
+        return AuthLoginOut(
+            ok=True,
+            token=token,
+            user=AuthUserOut(username=user.username, email=user.email, role="admin"),
+        )
+
+
 @app.get("/api/devices", response_model=list[DeviceOut])
 def get_devices() -> list[DeviceOut]:
     with get_session() as session:
@@ -94,6 +117,7 @@ def get_devices() -> list[DeviceOut]:
         output: list[DeviceOut] = []
         for d in items:
             refresh_online_state(session, d)
+            reason = mqtt_bridge.get_offline_reason(d.id) if not d.online else None
             output.append(
                 DeviceOut(
                     id=d.id,
@@ -101,6 +125,7 @@ def get_devices() -> list[DeviceOut]:
                     room=d.room,
                     online=d.online,
                     lastSeen=utc_iso(d.last_seen_ts),
+                    offlineReason=reason,
                 )
             )
         return output

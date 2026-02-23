@@ -25,6 +25,9 @@ class Settings:
     mqtt_username: str = os.getenv("MQTT_USERNAME", "")
     mqtt_password: str = os.getenv("MQTT_PASSWORD", "")
     mqtt_topic_prefix: str = os.getenv("MQTT_TOPIC_PREFIX", "dorm").strip("/") or "dorm"
+    admin_username: str = os.getenv("ADMIN_USERNAME", "admin")
+    admin_email: str = os.getenv("ADMIN_EMAIL", "admin@dorm.local")
+    admin_password: str = os.getenv("ADMIN_PASSWORD", "admin123")
     cmd_timeout_seconds: int = int(os.getenv("CMD_TIMEOUT_SECONDS", "30"))
     online_timeout_seconds: int = int(os.getenv("ONLINE_TIMEOUT_SECONDS", "10"))
 

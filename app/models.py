@@ -53,3 +53,16 @@ class CommandRecord(Base):
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class UserAccount(Base):
+    __tablename__ = "user_accounts"
+
+    username: Mapped[str] = mapped_column(String(64), primary_key=True)
+    email: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), default="admin", nullable=False)
+    reset_code_hash: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    reset_expires_at: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
