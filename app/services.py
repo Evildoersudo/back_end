@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -60,27 +61,60 @@ def ensure_seed_data(session: Session) -> None:
 
 
 def parse_room(device_id: str) -> str:
-    if device_id.startswith("A-") and "-" in device_id:
-        parts = device_id.split("-")
-        if len(parts) >= 2:
-            return f"{parts[0]}-{parts[1]}"
-    return "A-302"
+    room, _ = parse_device_meta(device_id)
+    return room
+
+
+ROOM_PATTERN = re.compile(r"^[A-Za-z]-?\d{2,4}$")
+LEGACY_DEVICE_PATTERN = re.compile(r"^([A-Za-z]-?\d{2,4})[-_](.+)$")
+
+
+def parse_device_meta(device_id: str) -> tuple[str, str]:
+    normalized = " ".join(device_id.strip().split())
+    if not normalized:
+        return "A-302", "unknown"
+
+    chunks = normalized.split(" ", 1)
+    if len(chunks) == 2 and ROOM_PATTERN.match(chunks[0]):
+        room, name = chunks[0], chunks[1].strip()
+        return room, name or normalized
+
+    legacy_match = LEGACY_DEVICE_PATTERN.match(normalized)
+    if legacy_match:
+        room = legacy_match.group(1).strip()
+        name = legacy_match.group(2).strip()
+        return room, name or normalized
+
+    if ROOM_PATTERN.match(normalized):
+        return normalized, normalized
+
+    return "A-302", normalized
 
 
 def upsert_device(session: Session, device_id: str, last_seen_ts: int | None = None) -> Device:
+    room, display_name = parse_device_meta(device_id)
     dev = session.get(Device, device_id)
+    if dev is None:
+        for obj in session.new:
+            if isinstance(obj, Device) and obj.id == device_id:
+                dev = obj
+                break
     now = int(time.time())
     seen = last_seen_ts or now
     if dev is None:
         dev = Device(
             id=device_id,
-            name=f"DormDevice-{device_id}",
-            room=parse_room(device_id),
+            name=display_name,
+            room=room,
             online=True,
             last_seen_ts=seen,
         )
         session.add(dev)
     else:
+        if dev.room == "A-302" and room != "A-302":
+            dev.room = room
+        if dev.name.startswith("DormDevice-") and display_name:
+            dev.name = display_name
         dev.last_seen_ts = max(dev.last_seen_ts, seen)
         dev.online = now - dev.last_seen_ts <= settings.online_timeout_seconds
     return dev
@@ -203,6 +237,50 @@ def update_cmd_state(
     if duration_ms is not None:
         cmd.duration_ms = duration_ms
     return cmd
+
+
+def apply_command_effect_to_status(session: Session, cmd: CommandRecord) -> None:
+    if cmd.socket is None:
+        return
+    action = (cmd.action or "").strip().lower()
+    if action not in {"on", "off"}:
+        return
+
+    status = session.get(StripStatus, cmd.device_id)
+    if status is None:
+        return
+
+    try:
+        sockets = json.loads(status.sockets_json)
+    except Exception:
+        sockets = []
+    if not isinstance(sockets, list):
+        sockets = []
+
+    changed = False
+    updated: list[dict[str, Any]] = []
+    for item in sockets:
+        if not isinstance(item, dict):
+            continue
+        sid = item.get("id")
+        if sid == cmd.socket:
+            next_item = dict(item)
+            next_item["on"] = action == "on"
+            if action == "off":
+                next_item["power_w"] = 0.0
+            changed = True
+            updated.append(next_item)
+        else:
+            updated.append(item)
+
+    if not changed:
+        return
+
+    status.sockets_json = json.dumps(updated, ensure_ascii=False)
+    status.total_power_w = float(
+        sum(float(x.get("power_w", 0.0)) for x in updated if isinstance(x, dict))
+    )
+    status.ts = int(time.time())
 
 
 def mark_timeouts(session: Session) -> None:

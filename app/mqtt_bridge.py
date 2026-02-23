@@ -10,7 +10,7 @@ import paho.mqtt.client as mqtt
 
 from .config import settings
 from .db import get_session
-from .services import save_telemetry_point, update_cmd_state, update_status_from_payload
+from .services import apply_command_effect_to_status, save_telemetry_point, update_cmd_state, update_status_from_payload
 from .ws import ws_manager
 
 logger = logging.getLogger("mqtt-bridge")
@@ -62,9 +62,17 @@ class MQTTBridge:
     def publish_cmd(self, device_id: str, payload: dict[str, Any]) -> bool:
         if not (self._enabled and self._connected):
             return False
-        topic = f"{settings.mqtt_topic_prefix}/{device_id}/cmd"
-        result = self._client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=1)
-        return result.rc == mqtt.MQTT_ERR_SUCCESS
+        topics: list[str] = [f"{settings.mqtt_topic_prefix}/{device_id}/cmd"]
+        chunks = [x for x in device_id.split(" ", 1) if x]
+        if len(chunks) == 2:
+            topics.append(f"{settings.mqtt_topic_prefix}/{chunks[0]}/{chunks[1]}/cmd")
+
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        ok = False
+        for topic in dict.fromkeys(topics):
+            result = self._client.publish(topic, payload_text, qos=1)
+            ok = ok or result.rc == mqtt.MQTT_ERR_SUCCESS
+        return ok
 
     def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any, reason_code: Any, properties: Any = None) -> None:
         self._connected = reason_code == 0
@@ -72,8 +80,12 @@ class MQTTBridge:
         if not self._connected:
             return
         base = settings.mqtt_topic_prefix
-        for topic in (f"{base}/+/status", f"{base}/+/telemetry", f"{base}/+/ack", f"{base}/+/event"):
-            client.subscribe(topic, qos=1)
+        for kind in ("status", "telemetry", "ack", "event"):
+            # Compatible with both:
+            # 1) dorm/{deviceId}/{kind}
+            # 2) dorm/{room}/{device}/{kind}
+            client.subscribe(f"{base}/+/{kind}", qos=1)
+            client.subscribe(f"{base}/+/+/{kind}", qos=1)
 
     def _on_disconnect(self, client: mqtt.Client, userdata: Any, disconnect_flags: Any, reason_code: Any, properties: Any = None) -> None:
         self._connected = False
@@ -86,11 +98,10 @@ class MQTTBridge:
             logger.warning("Invalid JSON payload on topic=%s", msg.topic)
             return
 
-        parts = msg.topic.split("/")
-        if len(parts) < 3:
+        parsed = self._parse_topic(msg.topic)
+        if parsed is None:
             return
-        device_id = parts[-2]
-        msg_type = parts[-1]
+        device_id, msg_type = parsed
 
         with get_session() as session:
             if msg_type == "status":
@@ -111,6 +122,8 @@ class MQTTBridge:
                     duration_ms=int(cost_ms) if isinstance(cost_ms, (int, float)) else None,
                 )
                 if cmd:
+                    if cmd.state == "success":
+                        apply_command_effect_to_status(session, cmd)
                     event = {
                         "type": "CMD_ACK",
                         "cmdId": cmd.cmd_id,
@@ -126,6 +139,37 @@ class MQTTBridge:
         if self._loop is None:
             return
         asyncio.run_coroutine_threadsafe(ws_manager.broadcast(payload), self._loop)
+
+    def _parse_topic(self, topic: str) -> tuple[str, str] | None:
+        topic_parts = [p for p in topic.strip("/").split("/") if p]
+        prefix_parts = [p for p in settings.mqtt_topic_prefix.strip("/").split("/") if p]
+        if len(topic_parts) < len(prefix_parts) + 2:
+            return None
+        if topic_parts[: len(prefix_parts)] != prefix_parts:
+            return None
+
+        tail = topic_parts[len(prefix_parts) :]
+        msg_type = tail[-1]
+        if msg_type not in {"status", "telemetry", "ack", "event"}:
+            return None
+
+        device_parts = [p.strip() for p in tail[:-1] if p.strip()]
+        if not device_parts:
+            return None
+
+        # Canonical device id: "{room} {device}" to keep URL-safe path segment (no slash).
+        if len(device_parts) == 1:
+            token = " ".join(device_parts[0].split())
+            return token, msg_type
+
+        if len(device_parts) == 2:
+            room = " ".join(device_parts[0].split())
+            dev = " ".join(device_parts[1].split())
+            if room and dev:
+                return f"{room} {dev}", msg_type
+            return " ".join([x for x in (room, dev) if x]), msg_type
+
+        return " ".join(device_parts), msg_type
 
 
 mqtt_bridge = MQTTBridge()
