@@ -42,7 +42,7 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@dorm.local}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change_admin_password}
       CMD_TIMEOUT_SECONDS: ${CMD_TIMEOUT_SECONDS:-30}
-      ONLINE_TIMEOUT_SECONDS: ${ONLINE_TIMEOUT_SECONDS:-10}
+      ONLINE_TIMEOUT_SECONDS: ${ONLINE_TIMEOUT_SECONDS:-60}
       TZ: Asia/Shanghai
 
 volumes:

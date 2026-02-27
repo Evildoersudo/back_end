@@ -18,7 +18,6 @@ class DeviceOut(BaseModel):
     room: str
     online: bool
     lastSeen: str
-    offlineReason: str | None = None
 
 
 class StripStatusOut(BaseModel):

@@ -29,7 +29,7 @@ class Settings:
     admin_email: str = os.getenv("ADMIN_EMAIL", "admin@dorm.local")
     admin_password: str = os.getenv("ADMIN_PASSWORD", "admin123")
     cmd_timeout_seconds: int = int(os.getenv("CMD_TIMEOUT_SECONDS", "30"))
-    online_timeout_seconds: int = int(os.getenv("ONLINE_TIMEOUT_SECONDS", "10"))
+    online_timeout_seconds: int = int(os.getenv("ONLINE_TIMEOUT_SECONDS", "60"))
 
 
 settings = Settings()

@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -86,40 +86,6 @@ def verify_password(password: str, encoded: str) -> bool:
         return False
 
 
-def find_user_by_account(session: Session, account: str) -> UserAccount | None:
-    normalized = account.strip()
-    if not normalized:
-        return None
-    return session.scalar(
-        select(UserAccount).where(
-            or_(
-                UserAccount.username == normalized,
-                UserAccount.email == normalized.lower(),
-            )
-        ).limit(1)
-    )
-
-
-def register_user(session: Session, username: str, email: str, password: str) -> UserAccount:
-    now = int(time.time())
-    normalized_username = username.strip()
-    normalized_email = email.strip().lower()
-    if session.get(UserAccount, normalized_username) is not None:
-        raise ValueError("username already exists")
-    if session.scalar(select(UserAccount.username).where(UserAccount.email == normalized_email).limit(1)):
-        raise ValueError("email already exists")
-    user = UserAccount(
-        username=normalized_username,
-        email=normalized_email,
-        password_hash=hash_password(password),
-        role="admin",
-        created_at=now,
-        updated_at=now,
-    )
-    session.add(user)
-    return user
-
-
 def login_user(session: Session, account: str, password: str) -> UserAccount | None:
     normalized = account.strip()
     admin_username = settings.admin_username.strip() or "admin"
@@ -133,34 +99,6 @@ def login_user(session: Session, account: str, password: str) -> UserAccount | N
         return None
     user.updated_at = int(time.time())
     return user
-
-
-def create_reset_code(session: Session, account: str, expires_in: int = 600) -> tuple[UserAccount | None, str]:
-    user = find_user_by_account(session, account)
-    if user is None:
-        return None, ""
-    code = f"{secrets.randbelow(1_000_000):06d}"
-    now = int(time.time())
-    user.reset_code_hash = hash_password(code)
-    user.reset_expires_at = now + expires_in
-    user.updated_at = now
-    return user, code
-
-
-def reset_password_with_code(session: Session, account: str, code: str, new_password: str) -> bool:
-    user = find_user_by_account(session, account)
-    if user is None:
-        return False
-    now = int(time.time())
-    if user.reset_expires_at < now:
-        return False
-    if not user.reset_code_hash or not verify_password(code, user.reset_code_hash):
-        return False
-    user.password_hash = hash_password(new_password)
-    user.reset_code_hash = ""
-    user.reset_expires_at = 0
-    user.updated_at = now
-    return True
 
 
 def ensure_default_admin(session: Session) -> None:
@@ -194,11 +132,6 @@ def ensure_default_admin(session: Session) -> None:
         changed = True
     if changed:
         user.updated_at = now
-
-
-def parse_room(device_id: str) -> str:
-    room, _ = parse_device_meta(device_id)
-    return room
 
 
 ROOM_PATTERN = re.compile(r"^[A-Za-z]-?\d{2,4}$")
@@ -263,8 +196,10 @@ def refresh_online_state(session: Session, device: Device) -> None:
 
 
 def update_status_from_payload(session: Session, device_id: str, payload: dict[str, Any]) -> None:
-    ts = int(payload.get("ts") or time.time())
-    device = upsert_device(session, device_id, ts)
+    now = int(time.time())
+    # Both heartbeat and status timestamp rely on server receive time.
+    ts = now
+    device = upsert_device(session, device_id, now)
     refresh_online_state(session, device)
 
     sockets = payload.get("sockets", [])
@@ -296,8 +231,10 @@ def update_status_from_payload(session: Session, device_id: str, payload: dict[s
 
 
 def save_telemetry_point(session: Session, device_id: str, payload: dict[str, Any]) -> None:
-    ts = int(payload.get("ts") or time.time())
-    upsert_device(session, device_id, ts)
+    now = int(time.time())
+    # Telemetry timestamp relies on server receive time.
+    ts = now
+    upsert_device(session, device_id, now)
     point = Telemetry(
         device_id=device_id,
         ts=ts,
@@ -308,58 +245,29 @@ def save_telemetry_point(session: Session, device_id: str, payload: dict[str, An
     session.add(point)
 
 
-def mark_device_offline(session: Session, device_id: str, reason: str = "", ts: int | None = None) -> Device:
-    now = ts or int(time.time())
-    offline_seen = max(0, now - settings.online_timeout_seconds - 1)
-    dev = session.get(Device, device_id)
-    if dev is None:
-        room, name = parse_device_meta(device_id)
-        dev = Device(
-            id=device_id,
-            name=name,
-            room=room,
-            online=False,
-            last_seen_ts=offline_seen,
-        )
-        session.add(dev)
-    else:
-        dev.last_seen_ts = min(dev.last_seen_ts, offline_seen)
-        dev.online = False
+def sync_status_metrics_from_telemetry(session: Session, device_id: str, payload: dict[str, Any]) -> None:
+    now = int(time.time())
+    device = upsert_device(session, device_id, now)
+    refresh_online_state(session, device)
 
     status = session.get(StripStatus, device_id)
     if status is None:
         status = StripStatus(
             device_id=device_id,
             ts=now,
-            online=False,
+            online=device.online,
             total_power_w=0.0,
             voltage_v=220.0,
             current_a=0.0,
             sockets_json="[]",
         )
         session.add(status)
-    else:
-        status.ts = now
-        status.online = False
-        status.total_power_w = 0.0
-        status.current_a = 0.0
-        try:
-            sockets = json.loads(status.sockets_json)
-        except Exception:
-            sockets = []
-        if isinstance(sockets, list):
-            normalized: list[dict[str, Any]] = []
-            for s in sockets:
-                if not isinstance(s, dict):
-                    continue
-                item = dict(s)
-                item["on"] = False
-                item["power_w"] = 0.0
-                normalized.append(item)
-            status.sockets_json = json.dumps(normalized, ensure_ascii=False)
 
-    _ = reason
-    return dev
+    status.ts = now
+    status.online = bool(payload.get("online", device.online))
+    status.total_power_w = float(payload.get("power_w", payload.get("total_power_w", status.total_power_w)))
+    status.voltage_v = float(payload.get("voltage_v", status.voltage_v))
+    status.current_a = float(payload.get("current_a", status.current_a))
 
 
 def create_cmd_record(session: Session, device_id: str, req: CmdRequest) -> CommandRecord:
@@ -524,18 +432,52 @@ def build_telemetry_series(
         .order_by(Telemetry.ts.asc())
     ).all()
 
-    latest_status = session.get(StripStatus, device_id)
-    carry = latest_status.total_power_w if latest_status else 0.0
+    # For long windows, return real telemetry samples (optionally down-sampled),
+    # instead of slot-filling with zeros, so the curve reflects true history.
+    if range_key != "60s":
+        if not rows:
+            return []
+        if len(rows) <= points:
+            return [{"ts": r.ts, "power_w": round(float(r.power_w), 3)} for r in rows]
 
+        sampled: list[Telemetry] = []
+        step_idx = (len(rows) - 1) / (points - 1)
+        for i in range(points):
+            idx = int(round(i * step_idx))
+            sampled.append(rows[idx])
+        return [{"ts": r.ts, "power_w": round(float(r.power_w), 3)} for r in sampled]
+
+    # For short window (60s), fill per-second slots and carry forward from the
+    # most recent point before the window start to avoid fake leading zeros.
+    prev_row = session.scalar(
+        select(Telemetry)
+        .where(
+            and_(
+                Telemetry.device_id == device_id,
+                Telemetry.ts < start_ts,
+            )
+        )
+        .order_by(Telemetry.ts.desc())
+        .limit(1)
+    )
+
+    slot_values: list[float | None] = [None] * points
+    for row in rows:
+        idx = (row.ts - start_ts) // step
+        if idx < 0:
+            continue
+        if idx >= points:
+            idx = points - 1
+        slot_values[idx] = float(row.power_w)
+
+    carry: float | None = float(prev_row.power_w) if prev_row is not None else None
     result: list[dict[str, float | int]] = []
-    idx = 0
     for i in range(points):
         slot_ts = start_ts + i * step
-        slot_end = slot_ts + step
-        while idx < len(rows) and rows[idx].ts <= slot_end:
-            carry = rows[idx].power_w
-            idx += 1
-        result.append({"ts": slot_ts, "power_w": round(float(carry), 3)})
+        value = slot_values[i]
+        if value is not None:
+            carry = value
+        result.append({"ts": slot_ts, "power_w": round(carry if carry is not None else 0.0, 3)})
     return result
 
 

@@ -117,7 +117,6 @@ def get_devices() -> list[DeviceOut]:
         output: list[DeviceOut] = []
         for d in items:
             refresh_online_state(session, d)
-            reason = mqtt_bridge.get_offline_reason(d.id) if not d.online else None
             output.append(
                 DeviceOut(
                     id=d.id,
@@ -125,7 +124,6 @@ def get_devices() -> list[DeviceOut]:
                     room=d.room,
                     online=d.online,
                     lastSeen=utc_iso(d.last_seen_ts),
-                    offlineReason=reason,
                 )
             )
         return output
